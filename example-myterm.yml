@@ -1,0 +1,14 @@
+name: example-project
+processes:
+  - name: web
+    command: npm run dev
+    autostart: true
+    autorestart: true
+  - name: worker
+    command: python worker.py
+    autostart: false
+    autorestart: true
+  - name: logs
+    command: tail -f logs/development.log
+    autostart: false
+    autorestart: false
