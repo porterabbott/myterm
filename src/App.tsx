@@ -437,7 +437,7 @@ export default function App() {
       <div className="flex flex-1 overflow-hidden">
         <aside className="w-64 border-r border-slate-800 bg-slate-900/50 p-4 flex flex-col">
           <div className="flex items-center justify-between mb-4">
-            <h1 className="text-lg font-semibold">MyTerm 🛠</h1>
+            <h1 className="text-lg font-semibold">MyTerm</h1>
             <button
               onClick={handleAddProject}
               className="rounded-md bg-emerald-600 px-2 py-1 text-xs font-semibold text-white hover:bg-emerald-500 transition"
