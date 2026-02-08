@@ -638,7 +638,8 @@ fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
 
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let output = Command::new(&shell)
-        .args(["-ilc", "gh api repos/porterabbott/myterm/releases/latest"])
+        .args(["-lc", "gh api repos/porterabbott/myterm/releases/latest 2>/dev/null"])
+        .stderr(Stdio::null())
         .output()
         .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
@@ -690,11 +691,11 @@ fn install_update(download_url: String) -> Result<(), String> {
     // Use gh CLI to download the asset (handles auth for private repos)
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     let dl_cmd = format!(
-        "gh release download --repo porterabbott/myterm --pattern MyTerm.zip --dir '{}'",
+        "gh release download --repo porterabbott/myterm --pattern MyTerm.zip --dir '{}' 2>/dev/null",
         temp_dir.display()
     );
     let dl_status = Command::new(&shell)
-        .args(["-ilc", &dl_cmd])
+        .args(["-lc", &dl_cmd])
         .status()
         .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
