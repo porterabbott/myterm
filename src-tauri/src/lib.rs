@@ -636,12 +636,11 @@ fn stop_process(
 fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
 
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = Command::new(&shell)
-        .args(["-lc", "gh api repos/porterabbott/myterm/releases/latest 2>/dev/null"])
-        .stderr(Stdio::null())
+    let output = Command::new("curl")
+        .args(["-sL", "-H", "Accept: application/vnd.github+json",
+               "https://api.github.com/repos/porterabbott/myterm/releases/latest"])
         .output()
-        .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
+        .map_err(|err| format!("Failed to fetch updates: {}", err))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -689,13 +688,10 @@ fn install_update(download_url: String) -> Result<(), String> {
     fs::create_dir_all(&extract_dir).map_err(|err| err.to_string())?;
 
     // Use gh CLI to download the asset (handles auth for private repos)
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let dl_cmd = format!(
-        "gh release download --repo porterabbott/myterm --pattern MyTerm.zip --dir '{}' 2>/dev/null",
-        temp_dir.display()
-    );
-    let dl_status = Command::new(&shell)
-        .args(["-lc", &dl_cmd])
+    let dl_status = Command::new("curl")
+        .args(["-sL", "-o"])
+        .arg(&zip_path)
+        .arg(&download_url)
         .status()
         .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
