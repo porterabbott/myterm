@@ -678,7 +678,7 @@ fn install_update(download_url: String) -> Result<(), String> {
     }
 
     let app_bundle = find_app_bundle_path()?;
-    let app_parent = app_bundle
+    let _app_parent = app_bundle
         .parent()
         .ok_or_else(|| "Could not determine app bundle parent".to_string())?;
 
@@ -719,15 +719,26 @@ fn install_update(download_url: String) -> Result<(), String> {
         .arg(&extracted_app)
         .status();
 
+    // Remove old app bundle first, then copy new one in
+    let rm_status = Command::new("rm")
+        .args(["-rf"])
+        .arg(&app_bundle)
+        .status()
+        .map_err(|err| err.to_string())?;
+
+    if !rm_status.success() {
+        return Err("Failed to remove old app bundle".to_string());
+    }
+
     let copy_status = Command::new("cp")
-        .arg("-R")
+        .args(["-R"])
         .arg(&extracted_app)
-        .arg(app_parent)
+        .arg(&app_bundle)
         .status()
         .map_err(|err| err.to_string())?;
 
     if !copy_status.success() {
-        return Err("Failed to replace app bundle".to_string());
+        return Err("Failed to copy new app bundle".to_string());
     }
 
     let _ = Command::new("xattr")
