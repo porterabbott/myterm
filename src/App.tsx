@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import AnsiToHtml from "ansi-to-html";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
@@ -51,6 +52,11 @@ type UpdateCheckResult = {
   downloadUrl: string;
 };
 
+type ConfigFilePayload = {
+  path: string;
+  contents: string;
+};
+
 const statusDot: Record<ProcessStatus, string> = {
   running: "bg-emerald-500",
   crashed: "bg-red-500",
@@ -86,6 +92,25 @@ export default function App() {
   const [updateDownloadUrl, setUpdateDownloadUrl] = useState<string | null>(null);
   const [updateNote, setUpdateNote] = useState<string | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [configEditorOpen, setConfigEditorOpen] = useState(false);
+  const [configEditorPath, setConfigEditorPath] = useState<string | null>(null);
+  const [configEditorContent, setConfigEditorContent] = useState("");
+  const [configEditorError, setConfigEditorError] = useState<string | null>(null);
+  const [configEditorLoading, setConfigEditorLoading] = useState(false);
+  const [configEditorSaving, setConfigEditorSaving] = useState(false);
+
+  const logContainerRef = useRef<HTMLDivElement | null>(null);
+  const ansiConverter = useMemo(
+    () =>
+      new AnsiToHtml({
+        fg: "#e2e8f0",
+        bg: "#0f172a",
+        escapeXML: true,
+        newline: true,
+      }),
+    []
+  );
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) || null,
@@ -100,6 +125,13 @@ export default function App() {
       ) || null
     );
   }, [selectedProject, selectedProcessName]);
+
+  const logHtml = useMemo(() => {
+    if (!selectedProcess || selectedProcess.logs.length === 0) return "";
+    return ansiConverter.toHtml(selectedProcess.logs.join("\n"));
+  }, [ansiConverter, selectedProcess]);
+
+  const canSendInput = !!selectedProcess && selectedProcess.status === "running";
 
   useEffect(() => {
     const unlistenLog = listen<LogEvent>("process-log", (event) => {
@@ -151,12 +183,27 @@ export default function App() {
   }, [selectedProject, selectedProcessName]);
 
   useEffect(() => {
+    if (!autoScrollLogs) return;
+    if (!logContainerRef.current) return;
+    logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+  }, [autoScrollLogs, logHtml]);
+
+  useEffect(() => {
     // Load persisted projects on mount
     const paths = loadProjectPaths();
     paths.forEach((path) => {
       loadProjectAtPath(path, false);
     });
   }, []);
+
+  useEffect(() => {
+    setConfigEditorOpen(false);
+    setConfigEditorError(null);
+    setConfigEditorPath(null);
+    setConfigEditorContent("");
+    setConfigEditorLoading(false);
+    setConfigEditorSaving(false);
+  }, [selectedProjectId]);
 
   useEffect(() => {
     getVersion()
@@ -320,8 +367,7 @@ export default function App() {
     }
   };
 
-  const handleReloadConfig = async (project: ProjectView) => {
-    setError(null);
+  const reloadProjectConfig = async (project: ProjectView) => {
     try {
       const config = await invoke<ProjectConfig>("load_project_config", {
         path: project.path,
@@ -349,9 +395,16 @@ export default function App() {
           };
         })
       );
+      return true;
     } catch (err) {
       setError(`Failed to reload config: ${String(err)}`);
+      return false;
     }
+  };
+
+  const handleReloadConfig = async (project: ProjectView) => {
+    setError(null);
+    await reloadProjectConfig(project);
   };
 
   const handleStartAll = () => {
@@ -382,6 +435,69 @@ export default function App() {
         };
       })
     );
+  };
+
+  const handleSendInput = async () => {
+    if (!selectedProject || !selectedProcess) return;
+    if (selectedProcess.status !== "running") return;
+
+    setError(null);
+    try {
+      const payload = `${terminalInput}\n`;
+      await invoke("write_to_process", {
+        projectPath: selectedProject.path,
+        processName: selectedProcess.name,
+        input: payload,
+      });
+      setTerminalInput("");
+    } catch (err) {
+      setError(`Failed to send input to ${selectedProcess.name}: ${String(err)}`);
+    }
+  };
+
+  const handleOpenConfigEditor = async () => {
+    if (!selectedProject) return;
+    setConfigEditorError(null);
+    setConfigEditorContent("");
+    setConfigEditorPath(`${selectedProject.path}/myterm.yml`);
+    setConfigEditorOpen(true);
+    setConfigEditorLoading(true);
+
+    try {
+      const result = await invoke<ConfigFilePayload>(
+        "read_project_config_file",
+        {
+          path: selectedProject.path,
+        }
+      );
+      setConfigEditorPath(result.path);
+      setConfigEditorContent(result.contents);
+    } catch (err) {
+      setConfigEditorError(`Failed to load config: ${String(err)}`);
+    } finally {
+      setConfigEditorLoading(false);
+    }
+  };
+
+  const handleSaveConfigEditor = async () => {
+    if (!selectedProject) return;
+    setConfigEditorError(null);
+    setConfigEditorSaving(true);
+
+    try {
+      await invoke("write_project_config_file", {
+        path: selectedProject.path,
+        contents: configEditorContent,
+      });
+      const ok = await reloadProjectConfig(selectedProject);
+      if (ok) {
+        setConfigEditorOpen(false);
+      }
+    } catch (err) {
+      setConfigEditorError(`Failed to save config: ${String(err)}`);
+    } finally {
+      setConfigEditorSaving(false);
+    }
   };
 
   const handleCheckForUpdates = async () => {
@@ -548,7 +664,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="flex flex-1 flex-col overflow-hidden">
+        <main className="relative flex flex-1 flex-col overflow-hidden">
           {selectedProject ? (
             <>
               <header className="border-b border-slate-800 px-6 py-4 flex items-center justify-between">
@@ -564,21 +680,39 @@ export default function App() {
                       Open →
                     </button>
                     {selectedProject.configError ? (
-                      <button
-                        onClick={() => handleCreateConfig(selectedProject)}
-                        className="text-emerald-400 hover:text-emerald-300 transition"
-                        title="Create myterm.yml"
-                      >
-                        Create config
-                      </button>
+                      <>
+                        <button
+                          onClick={() => handleCreateConfig(selectedProject)}
+                          className="text-emerald-400 hover:text-emerald-300 transition"
+                          title="Create myterm.yml"
+                        >
+                          Create config
+                        </button>
+                        <button
+                          onClick={handleOpenConfigEditor}
+                          className="text-slate-400 hover:text-slate-300 transition"
+                          title="Edit myterm.yml"
+                        >
+                          Edit
+                        </button>
+                      </>
                     ) : (
-                      <button
-                        onClick={() => handleReloadConfig(selectedProject)}
-                        className="text-slate-400 hover:text-slate-300 transition"
-                        title="Reload myterm.yml"
-                      >
-                        Reload
-                      </button>
+                      <>
+                        <button
+                          onClick={() => handleReloadConfig(selectedProject)}
+                          className="text-slate-400 hover:text-slate-300 transition"
+                          title="Reload myterm.yml"
+                        >
+                          Reload
+                        </button>
+                        <button
+                          onClick={handleOpenConfigEditor}
+                          className="text-slate-400 hover:text-slate-300 transition"
+                          title="Edit myterm.yml"
+                        >
+                          Edit
+                        </button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -710,11 +844,49 @@ export default function App() {
                         </button>
                       </div>
                     </div>
-                    <pre className="flex-1 overflow-y-auto bg-slate-950 px-6 py-4 text-xs leading-relaxed text-slate-100 font-mono">
-                      {selectedProcess && selectedProcess.logs.length > 0
-                        ? selectedProcess.logs.join("\n")
-                        : "No logs yet."}
-                    </pre>
+                    <div
+                      ref={logContainerRef}
+                      className="flex-1 overflow-y-auto bg-slate-950 px-6 py-4 text-xs leading-relaxed text-slate-100 font-mono"
+                    >
+                      {selectedProcess && selectedProcess.logs.length > 0 ? (
+                        <div
+                          className="whitespace-pre-wrap break-words"
+                          dangerouslySetInnerHTML={{ __html: logHtml }}
+                        />
+                      ) : (
+                        <div className="text-slate-500">No logs yet.</div>
+                      )}
+                    </div>
+                    <div className="border-t border-slate-800 px-6 py-3 bg-slate-900/40">
+                      <form
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          handleSendInput();
+                        }}
+                        className="flex items-center gap-2"
+                      >
+                        <span className="text-xs text-slate-500 font-mono">›</span>
+                        <input
+                          type="text"
+                          value={terminalInput}
+                          onChange={(event) => setTerminalInput(event.target.value)}
+                          disabled={!canSendInput}
+                          placeholder={
+                            canSendInput
+                              ? "Type input and press Enter…"
+                              : "Start the process to send input"
+                          }
+                          className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-50"
+                        />
+                        <button
+                          type="submit"
+                          disabled={!canSendInput}
+                          className="rounded-md bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 transition"
+                        >
+                          Send
+                        </button>
+                      </form>
+                    </div>
                   </div>
                 </div>
               )}
@@ -724,6 +896,62 @@ export default function App() {
               <div className="text-center">
                 <div className="text-lg mb-2">No project selected</div>
                 <div className="text-sm">Add a project to get started</div>
+              </div>
+            </div>
+          )}
+          {configEditorOpen && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/80 p-6 backdrop-blur-sm">
+              <div className="flex w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-slate-800 bg-slate-900 shadow-xl">
+                <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+                  <div>
+                    <div className="text-sm font-semibold">Edit myterm.yml</div>
+                    {configEditorPath && (
+                      <div className="text-xs text-slate-400">{configEditorPath}</div>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => setConfigEditorOpen(false)}
+                    className="text-slate-400 hover:text-slate-200"
+                    title="Close"
+                  >
+                    ×
+                  </button>
+                </div>
+                <div className="flex-1 overflow-hidden p-4">
+                  {configEditorLoading ? (
+                    <div className="text-xs text-slate-400">Loading config…</div>
+                  ) : (
+                    <textarea
+                      value={configEditorContent}
+                      onChange={(event) => setConfigEditorContent(event.target.value)}
+                      spellCheck={false}
+                      className="h-72 w-full resize-none rounded-md border border-slate-800 bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                    />
+                  )}
+                  {configEditorError && (
+                    <div className="mt-2 text-xs text-red-400">{configEditorError}</div>
+                  )}
+                </div>
+                <div className="flex items-center justify-between border-t border-slate-800 px-4 py-3">
+                  <span className="text-[11px] text-slate-500">
+                    Saves to disk and reloads the config.
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setConfigEditorOpen(false)}
+                      className="rounded-md border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:bg-slate-800 transition"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleSaveConfigEditor}
+                      disabled={configEditorSaving || configEditorLoading}
+                      className="rounded-md bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40 transition"
+                    >
+                      {configEditorSaving ? "Saving…" : "Save"}
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}

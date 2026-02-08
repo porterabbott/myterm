@@ -3,7 +3,7 @@ use std::{
     collections::HashMap,
     env,
     fs::{self},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -56,6 +56,7 @@ struct ManagedProcess {
     /// because we call `setpgid(0, 0)` in the child.
     pid: u32,
     stop_flag: Arc<AtomicBool>,
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -91,6 +92,13 @@ struct UpdateInfo {
     available: bool,
     version: String,
     download_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigFilePayload {
+    path: String,
+    contents: String,
 }
 
 fn process_key(project_path: &str, process_name: &str) -> String {
@@ -148,6 +156,12 @@ fn config_path_candidates(project_path: &Path) -> Vec<PathBuf> {
         project_path.join("myterm.yml"),
         project_path.join("myterm.yaml"),
     ]
+}
+
+fn find_existing_config_path(project_path: &Path) -> Option<PathBuf> {
+    config_path_candidates(project_path)
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn read_project_config(project_path: &Path) -> Result<ProjectConfig, String> {
@@ -454,6 +468,30 @@ fn init_project_config(path: String) -> Result<ProjectConfig, String> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn read_project_config_file(path: String) -> Result<ConfigFilePayload, String> {
+    let project_path = Path::new(&path);
+    let config_path = find_existing_config_path(project_path)
+        .ok_or_else(|| "Missing myterm.yml".to_string())?;
+    let contents = fs::read_to_string(&config_path)
+        .map_err(|err| format!("{} ({})", err, config_path.display()))?;
+    Ok(ConfigFilePayload {
+        path: config_path.to_string_lossy().to_string(),
+        contents,
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn write_project_config_file(path: String, contents: String) -> Result<(), String> {
+    let project_path = Path::new(&path);
+    let config_path = find_existing_config_path(project_path)
+        .unwrap_or_else(|| project_path.join("myterm.yml"));
+
+    fs::write(&config_path, contents)
+        .map_err(|err| format!("{} ({})", err, config_path.display()))?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn start_process(
     app: AppHandle,
     state: State<ProcessManager>,
@@ -478,6 +516,7 @@ fn start_process(
             ManagedProcess {
                 pid: 0,
                 stop_flag: Arc::new(AtomicBool::new(false)),
+                stdin: Arc::new(Mutex::new(None)),
             },
         );
     }
@@ -503,6 +542,7 @@ fn start_process(
             cmd.arg("-ilc")
                 .arg(&command)
                 .current_dir(&project_path)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
@@ -544,6 +584,11 @@ fn start_process(
             if let Ok(mut map) = manager.processes.lock() {
                 if let Some(entry) = map.get_mut(&key) {
                     entry.pid = pid;
+                    if let Some(stdin) = child.stdin.take() {
+                        if let Ok(mut handle) = entry.stdin.lock() {
+                            *handle = Some(stdin);
+                        }
+                    }
                 }
             }
 
@@ -570,6 +615,15 @@ fn start_process(
             }
 
             let status = child.wait();
+
+            if let Ok(mut map) = manager.processes.lock() {
+                if let Some(entry) = map.get_mut(&key) {
+                    if let Ok(mut handle) = entry.stdin.lock() {
+                        *handle = None;
+                    }
+                }
+            }
+
             match status {
                 Ok(status) => {
                     if let Some(code) = status.code() {
@@ -665,6 +719,41 @@ fn stop_process(
     }
 
     Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn write_to_process(
+    state: State<ProcessManager>,
+    project_path: String,
+    process_name: String,
+    input: String,
+) -> Result<(), String> {
+    let key = process_key(&project_path, &process_name);
+    let stdin = {
+        let map = state
+            .processes
+            .lock()
+            .map_err(|_| "Process map poisoned".to_string())?;
+        let Some(entry) = map.get(&key) else {
+            return Err("Process not running".to_string());
+        };
+        entry.stdin.clone()
+    };
+
+    let mut handle = stdin
+        .lock()
+        .map_err(|_| "Process stdin poisoned".to_string())?;
+    if let Some(stdin) = handle.as_mut() {
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|err| format!("Failed to write to stdin: {}", err))?;
+        stdin
+            .flush()
+            .map_err(|err| format!("Failed to flush stdin: {}", err))?;
+        Ok(())
+    } else {
+        Err("Process stdin not available".to_string())
+    }
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -866,8 +955,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_project_config,
             init_project_config,
+            read_project_config_file,
+            write_project_config_file,
             start_process,
             stop_process,
+            write_to_process,
             check_for_update,
             install_update,
             restart_app
