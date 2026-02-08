@@ -719,15 +719,18 @@ fn install_update(download_url: String) -> Result<(), String> {
         .arg(&extracted_app)
         .status();
 
-    // Remove old app bundle first, then copy new one in
-    let rm_status = Command::new("rm")
-        .args(["-rf"])
+    // Move old bundle aside (keeps running binary intact), copy new one in, then clean up
+    let backup_bundle = app_bundle.with_extension("app.old");
+    let _ = Command::new("rm").args(["-rf"]).arg(&backup_bundle).status();
+
+    let mv_status = Command::new("mv")
         .arg(&app_bundle)
+        .arg(&backup_bundle)
         .status()
         .map_err(|err| err.to_string())?;
 
-    if !rm_status.success() {
-        return Err("Failed to remove old app bundle".to_string());
+    if !mv_status.success() {
+        return Err("Failed to move old app bundle".to_string());
     }
 
     let copy_status = Command::new("cp")
@@ -752,10 +755,20 @@ fn install_update(download_url: String) -> Result<(), String> {
 #[tauri::command(rename_all = "camelCase")]
 fn restart_app(app: AppHandle) -> Result<(), String> {
     let app_bundle = find_app_bundle_path()?;
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(600));
-        let _ = Command::new("open").arg(&app_bundle).spawn();
-    });
+    // The old .app.old is the renamed original (still running). 
+    // Spawn a background script that waits for us to exit, cleans up, and relaunches.
+    let backup_bundle = app_bundle.with_extension("app.old");
+    let script = format!(
+        "sleep 1; rm -rf '{}'; open '{}'",
+        backup_bundle.display(),
+        app_bundle.display()
+    );
+    let _ = Command::new("/bin/sh")
+        .args(["-c", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
     app.exit(0);
     Ok(())
 }
