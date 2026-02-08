@@ -376,8 +376,9 @@ fn start_process(
                 break;
             }
 
-            let mut cmd = Command::new("sh");
-            cmd.arg("-lc")
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let mut cmd = Command::new(&shell);
+            cmd.arg("-ilc")
                 .arg(&command)
                 .current_dir(&project_path)
                 .stdout(Stdio::piped())
