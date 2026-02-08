@@ -753,24 +753,23 @@ fn install_update(download_url: String) -> Result<(), String> {
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn restart_app(app: AppHandle) -> Result<(), String> {
+fn restart_app(_app: AppHandle) -> Result<(), String> {
     let app_bundle = find_app_bundle_path()?;
-    // The old .app.old is the renamed original (still running). 
-    // Spawn a background script that waits for us to exit, cleans up, and relaunches.
     let backup_bundle = app_bundle.with_extension("app.old");
+    // Use nohup + disown equivalent: fully detached process that outlives us
     let script = format!(
-        "sleep 1; rm -rf '{}'; open '{}'",
+        "sleep 2; rm -rf '{}'; open -n '{}'; exit 0",
         backup_bundle.display(),
         app_bundle.display()
     );
-    let _ = Command::new("/bin/sh")
-        .args(["-c", &script])
+    let _ = Command::new("/usr/bin/nohup")
+        .args(["/bin/sh", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-    app.exit(0);
-    Ok(())
+    // Hard exit to avoid cleanup hooks that might hang
+    std::process::exit(0);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
