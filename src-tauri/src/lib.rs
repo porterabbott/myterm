@@ -985,9 +985,17 @@ fn restart_app(app: AppHandle, state: State<RestartState>) -> Result<(), String>
         ));
     }
 
+    // Stop all managed processes before exiting (so we don't orphan dev servers)
+    let manager = app.state::<ProcessManager>();
+    let pgids = stop_all_processes(manager.inner());
+    #[cfg(unix)]
+    {
+        wait_then_force_kill(pgids, Duration::from_millis(500), Duration::from_millis(500));
+    }
+
     spawn_restart_helper(&app_bundle, &backup_bundle)?;
     state.mark_update_restart();
-    // Hard exit — bypass all Tauri cleanup to avoid hangs
+    // Hard exit — bypass Tauri window cleanup to avoid hangs
     // The setsid helper script survives this and relaunches the app
     std::process::exit(0);
 }
