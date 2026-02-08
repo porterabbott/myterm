@@ -1,4 +1,9 @@
 name: example-project
+actions:
+  - name: Open in Cursor
+    command: cursor .
+  - name: Open in Chrome
+    command: open -a "Google Chrome" http://localhost:3000
 processes:
   - name: web
     command: npm run dev

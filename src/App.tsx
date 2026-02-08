@@ -15,8 +15,14 @@ type ProcessConfig = {
   autorestart?: boolean;
 };
 
+type ActionConfig = {
+  name: string;
+  command: string;
+};
+
 type ProjectConfig = {
   name: string;
+  actions?: ActionConfig[];
   processes: ProcessConfig[];
 };
 
@@ -29,6 +35,7 @@ type ProjectView = {
   id: string;
   name: string;
   path: string;
+  actions: ActionConfig[];
   processes: ProcessView[];
   configError?: string;
 };
@@ -252,6 +259,7 @@ export default function App() {
         id: path,
         path,
         name: config.name || path,
+        actions: config.actions ?? [],
         processes: config.processes.map((process) => ({
           ...process,
           status: "stopped",
@@ -282,6 +290,7 @@ export default function App() {
         id: path,
         path,
         name: path.split("/").pop() || "unknown",
+        actions: [],
         processes: [],
         configError: errorMsg,
       };
@@ -351,6 +360,7 @@ export default function App() {
           return {
             ...p,
             name: config.name,
+            actions: config.actions ?? [],
             processes: config.processes.map((process) => ({
               ...process,
               status: "stopped",
@@ -390,6 +400,7 @@ export default function App() {
           return {
             ...p,
             name: config.name,
+            actions: config.actions ?? [],
             processes: updatedProcesses,
             configError: undefined,
           };
@@ -419,6 +430,18 @@ export default function App() {
     selectedProject.processes
       .filter((process) => process.status === "running")
       .forEach((process) => stopProcess(selectedProject, process));
+  };
+
+  const handleRunAction = async (project: ProjectView, action: ActionConfig) => {
+    setError(null);
+    try {
+      await invoke("run_action", {
+        projectPath: project.path,
+        command: action.command,
+      });
+    } catch (err) {
+      setError(`Failed to run action "${action.name}": ${String(err)}`);
+    }
   };
 
   const handleClearLogs = () => {
@@ -717,7 +740,7 @@ export default function App() {
                   </div>
                 </div>
                 {!selectedProject.configError && (
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap justify-end gap-2">
                     <button
                       onClick={handleStartAll}
                       className="rounded-md border border-emerald-500 px-3 py-1 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/20 transition"
@@ -730,6 +753,16 @@ export default function App() {
                     >
                       Stop all
                     </button>
+                    {selectedProject.actions.map((action) => (
+                      <button
+                        key={action.name}
+                        onClick={() => handleRunAction(selectedProject, action)}
+                        className="max-w-44 truncate rounded-md border border-slate-500/60 px-3 py-1 text-xs font-semibold text-slate-200 hover:bg-slate-500/10 transition"
+                        title={action.command}
+                      >
+                        {action.name}
+                      </button>
+                    ))}
                   </div>
                 )}
               </header>

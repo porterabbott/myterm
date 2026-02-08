@@ -26,8 +26,16 @@ struct ProcessConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+struct ActionConfig {
+    name: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ProjectConfig {
     name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    actions: Vec<ActionConfig>,
     processes: Vec<ProcessConfig>,
 }
 
@@ -457,6 +465,7 @@ fn init_project_config(path: String) -> Result<ProjectConfig, String> {
 
     let config = ProjectConfig {
         name: detect_project_name(project_path),
+        actions: Vec::new(),
         processes: guess_processes(project_path),
     };
 
@@ -757,6 +766,44 @@ fn write_to_process(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+fn run_action(project_path: String, command: String) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("Missing command".to_string());
+    }
+
+    let mut cmd = Command::new("/bin/zsh");
+    cmd.arg("-lc")
+        .arg(&command)
+        .current_dir(&project_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Detach from the app process so actions can open external apps freely.
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("Failed to run action: {}", err))?;
+
+    // Reap in background to avoid zombies, but don't track as a managed process.
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
 fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
 
@@ -960,6 +1007,7 @@ pub fn run() {
             start_process,
             stop_process,
             write_to_process,
+            run_action,
             check_for_update,
             install_update,
             restart_app
