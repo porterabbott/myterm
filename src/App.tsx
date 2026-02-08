@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 
 type ProcessStatus = "running" | "stopped" | "crashed";
 
@@ -44,6 +45,12 @@ type StatusEvent = {
   status: ProcessStatus;
 };
 
+type UpdateCheckResult = {
+  available: boolean;
+  version: string;
+  downloadUrl: string;
+};
+
 const statusDot: Record<ProcessStatus, string> = {
   running: "bg-emerald-500",
   crashed: "bg-red-500",
@@ -71,6 +78,14 @@ export default function App() {
   const [selectedProcessName, setSelectedProcessName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoScrollLogs, setAutoScrollLogs] = useState(true);
+  const [currentVersion, setCurrentVersion] = useState<string>("");
+  const [updateStatus, setUpdateStatus] = useState<
+    "idle" | "checking" | "available" | "downloading" | "restart"
+  >("idle");
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [updateDownloadUrl, setUpdateDownloadUrl] = useState<string | null>(null);
+  const [updateNote, setUpdateNote] = useState<string | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) || null,
@@ -141,6 +156,14 @@ export default function App() {
     paths.forEach((path) => {
       loadProjectAtPath(path, false);
     });
+  }, []);
+
+  useEffect(() => {
+    getVersion()
+      .then((version) => setCurrentVersion(version))
+      .catch(() => {
+        setCurrentVersion("");
+      });
   }, []);
 
   const startProcess = async (project: ProjectView, process: ProcessView) => {
@@ -361,6 +384,54 @@ export default function App() {
     );
   };
 
+  const handleCheckForUpdates = async () => {
+    setUpdateError(null);
+    setUpdateNote(null);
+    setUpdateStatus("checking");
+
+    try {
+      const result = await invoke<UpdateCheckResult>("check_for_update");
+      if (result.available) {
+        setUpdateStatus("available");
+        setUpdateVersion(result.version);
+        setUpdateDownloadUrl(result.downloadUrl);
+        setUpdateNote(null);
+      } else {
+        setUpdateStatus("idle");
+        setUpdateVersion(null);
+        setUpdateDownloadUrl(null);
+        setUpdateNote("You're up to date.");
+      }
+    } catch (err) {
+      setUpdateStatus("idle");
+      setUpdateError(`Update check failed: ${String(err)}`);
+    }
+  };
+
+  const handleUpdateNow = async () => {
+    if (!updateDownloadUrl) return;
+    setUpdateError(null);
+    setUpdateStatus("downloading");
+
+    try {
+      await invoke("install_update", { downloadUrl: updateDownloadUrl });
+      setUpdateStatus("restart");
+      setUpdateNote(null);
+    } catch (err) {
+      setUpdateStatus("available");
+      setUpdateError(`Update failed: ${String(err)}`);
+    }
+  };
+
+  const handleRestartApp = async () => {
+    setUpdateError(null);
+    try {
+      await invoke("restart_app");
+    } catch (err) {
+      setUpdateError(`Restart failed: ${String(err)}`);
+    }
+  };
+
   return (
     <div className="h-screen w-screen bg-slate-950 text-slate-100 flex flex-col">
       <div className="flex flex-1 overflow-hidden">
@@ -417,6 +488,62 @@ export default function App() {
                   </button>
                 </div>
               ))
+            )}
+          </div>
+
+          <div className="mt-4 border-t border-slate-800 pt-3 text-xs text-slate-400">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-500">
+                {currentVersion ? `v${currentVersion}` : ""}
+              </span>
+              <button
+                onClick={handleCheckForUpdates}
+                disabled={
+                  updateStatus === "checking" || updateStatus === "downloading"
+                }
+                className="text-emerald-400 hover:text-emerald-300 disabled:opacity-40 transition"
+                title="Check for updates"
+              >
+                {updateStatus === "checking" ? "Checking…" : "Check updates"}
+              </button>
+            </div>
+
+            {updateStatus === "available" && (
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <span className="text-emerald-300 truncate">
+                  Update available: {updateVersion}
+                </span>
+                <button
+                  onClick={handleUpdateNow}
+                  className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-emerald-500 transition"
+                >
+                  Update now
+                </button>
+              </div>
+            )}
+
+            {updateStatus === "downloading" && (
+              <div className="mt-2 text-slate-500">Downloading update…</div>
+            )}
+
+            {updateStatus === "restart" && (
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <span className="text-emerald-300">Restart to finish update</span>
+                <button
+                  onClick={handleRestartApp}
+                  className="rounded-md bg-emerald-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-emerald-500 transition"
+                >
+                  Restart
+                </button>
+              </div>
+            )}
+
+            {updateNote && updateStatus === "idle" && (
+              <div className="mt-2 text-slate-500">{updateNote}</div>
+            )}
+
+            {updateError && (
+              <div className="mt-2 text-red-400">{updateError}</div>
             )}
           </div>
         </aside>

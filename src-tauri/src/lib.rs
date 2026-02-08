@@ -1,7 +1,10 @@
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    io::{BufRead, BufReader},
+    env,
+    fs::{self, File},
+    io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -9,7 +12,7 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -54,6 +57,26 @@ struct StatusEvent {
     project_path: String,
     process_name: String,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    available: bool,
+    version: String,
+    download_url: String,
 }
 
 fn process_key(project_path: &str, process_name: &str) -> String {
@@ -305,6 +328,71 @@ fn guess_processes(project_path: &Path) -> Vec<ProcessConfig> {
     }]
 }
 
+fn parse_version(version: &str) -> Vec<u32> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    let latest_parts = parse_version(latest);
+    let current_parts = parse_version(current);
+    let max_len = latest_parts.len().max(current_parts.len());
+
+    for idx in 0..max_len {
+        let latest_value = *latest_parts.get(idx).unwrap_or(&0);
+        let current_value = *current_parts.get(idx).unwrap_or(&0);
+        if latest_value > current_value {
+            return true;
+        }
+        if latest_value < current_value {
+            return false;
+        }
+    }
+
+    false
+}
+
+fn find_app_bundle_path() -> Result<PathBuf, String> {
+    let exe_path = env::current_exe().map_err(|err| err.to_string())?;
+    for ancestor in exe_path.ancestors() {
+        if ancestor.extension().and_then(|ext| ext.to_str()) == Some("app") {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+
+    Err("Could not determine app bundle path".to_string())
+}
+
+fn create_temp_dir() -> Result<PathBuf, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| err.to_string())?
+        .as_millis();
+    let dir = env::temp_dir().join(format!("myterm-update-{}", stamp));
+    fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+    Ok(dir)
+}
+
+fn find_app_in_dir(root: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
+                return Some(path);
+            }
+            if let Some(found) = find_app_in_dir(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn load_project_config(path: String) -> Result<ProjectConfig, String> {
     let project_path = Path::new(&path);
@@ -545,6 +633,132 @@ fn stop_process(
     Ok(())
 }
 
+#[tauri::command(rename_all = "camelCase")]
+fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    let current_version = app.package_info().version.to_string();
+    let client = Client::builder()
+        .user_agent("MyTerm")
+        .build()
+        .map_err(|err| err.to_string())?;
+
+    let response = client
+        .get("https://api.github.com/repos/porterabbott/myterm/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "GitHub API returned {}",
+            response.status()
+        ));
+    }
+
+    let release: GithubRelease = response.json().map_err(|err| err.to_string())?;
+    let latest_tag = release.tag_name.clone();
+    let latest_version = latest_tag.trim_start_matches('v');
+    let available = is_newer_version(latest_version, &current_version);
+
+    let download_url = if available {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name == "MyTerm.zip")
+            .map(|asset| asset.browser_download_url.clone())
+            .ok_or_else(|| "Update available, but MyTerm.zip asset not found".to_string())?
+    } else {
+        String::new()
+    };
+
+    Ok(UpdateInfo {
+        available,
+        version: latest_tag,
+        download_url,
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn install_update(download_url: String) -> Result<(), String> {
+    if download_url.trim().is_empty() {
+        return Err("Missing download URL".to_string());
+    }
+
+    let app_bundle = find_app_bundle_path()?;
+    let app_parent = app_bundle
+        .parent()
+        .ok_or_else(|| "Could not determine app bundle parent".to_string())?;
+
+    let temp_dir = create_temp_dir()?;
+    let zip_path = temp_dir.join("MyTerm.zip");
+    let extract_dir = temp_dir.join("extract");
+    fs::create_dir_all(&extract_dir).map_err(|err| err.to_string())?;
+
+    let client = Client::builder()
+        .user_agent("MyTerm")
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut response = client
+        .get(&download_url)
+        .send()
+        .map_err(|err| err.to_string())?;
+
+    if !response.status().is_success() {
+        return Err(format!("Download failed: {}", response.status()));
+    }
+
+    let mut file = File::create(&zip_path).map_err(|err| err.to_string())?;
+    io::copy(&mut response, &mut file).map_err(|err| err.to_string())?;
+
+    let unzip_status = Command::new("unzip")
+        .arg("-q")
+        .arg(&zip_path)
+        .arg("-d")
+        .arg(&extract_dir)
+        .status()
+        .map_err(|err| err.to_string())?;
+
+    if !unzip_status.success() {
+        return Err("Failed to unzip update".to_string());
+    }
+
+    let extracted_app = find_app_in_dir(&extract_dir)
+        .ok_or_else(|| "Could not locate extracted .app bundle".to_string())?;
+
+    let _ = Command::new("xattr")
+        .arg("-cr")
+        .arg(&extracted_app)
+        .status();
+
+    let copy_status = Command::new("cp")
+        .arg("-R")
+        .arg(&extracted_app)
+        .arg(app_parent)
+        .status()
+        .map_err(|err| err.to_string())?;
+
+    if !copy_status.success() {
+        return Err("Failed to replace app bundle".to_string());
+    }
+
+    let _ = Command::new("xattr")
+        .arg("-cr")
+        .arg(&app_bundle)
+        .status();
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn restart_app(app: AppHandle) -> Result<(), String> {
+    let app_bundle = find_app_bundle_path()?;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(600));
+        let _ = Command::new("open").arg(&app_bundle).spawn();
+    });
+    app.exit(0);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -555,7 +769,10 @@ pub fn run() {
             load_project_config,
             init_project_config,
             start_process,
-            stop_process
+            stop_process,
+            check_for_update,
+            install_update,
+            restart_app
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
