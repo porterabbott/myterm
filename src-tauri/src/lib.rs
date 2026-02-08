@@ -636,8 +636,9 @@ fn stop_process(
 fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
 
-    let output = Command::new("gh")
-        .args(["api", "repos/porterabbott/myterm/releases/latest"])
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = Command::new(&shell)
+        .args(["-ilc", "gh api repos/porterabbott/myterm/releases/latest"])
         .output()
         .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
@@ -687,9 +688,13 @@ fn install_update(download_url: String) -> Result<(), String> {
     fs::create_dir_all(&extract_dir).map_err(|err| err.to_string())?;
 
     // Use gh CLI to download the asset (handles auth for private repos)
-    let dl_status = Command::new("gh")
-        .args(["release", "download", "--repo", "porterabbott/myterm", "--pattern", "MyTerm.zip", "--dir"])
-        .arg(&temp_dir)
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let dl_cmd = format!(
+        "gh release download --repo porterabbott/myterm --pattern MyTerm.zip --dir '{}'",
+        temp_dir.display()
+    );
+    let dl_status = Command::new(&shell)
+        .args(["-ilc", &dl_cmd])
         .status()
         .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
