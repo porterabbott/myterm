@@ -36,6 +36,21 @@ struct ProcessManager {
     processes: Arc<Mutex<HashMap<String, ManagedProcess>>>,
 }
 
+#[derive(Default)]
+struct RestartState {
+    skip_process_cleanup: AtomicBool,
+}
+
+impl RestartState {
+    fn mark_update_restart(&self) {
+        self.skip_process_cleanup.store(true, Ordering::SeqCst);
+    }
+
+    fn should_skip_cleanup(&self) -> bool {
+        self.skip_process_cleanup.load(Ordering::SeqCst)
+    }
+}
+
 struct ManagedProcess {
     /// PID of the shell process we spawn. On Unix we also use this as the process group id (pgid)
     /// because we call `setpgid(0, 0)` in the child.
@@ -355,15 +370,35 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     false
 }
 
+fn is_backup_bundle(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("old")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".app.old"))
+            .unwrap_or(false)
+}
+
 fn find_app_bundle_path() -> Result<PathBuf, String> {
     let exe_path = env::current_exe().map_err(|err| err.to_string())?;
     for ancestor in exe_path.ancestors() {
         if ancestor.extension().and_then(|ext| ext.to_str()) == Some("app") {
             return Ok(ancestor.to_path_buf());
         }
+        if is_backup_bundle(ancestor) {
+            return Ok(ancestor.to_path_buf());
+        }
     }
 
     Err("Could not determine app bundle path".to_string())
+}
+
+fn resolve_primary_app_bundle_path(running_bundle: &Path) -> PathBuf {
+    if is_backup_bundle(running_bundle) {
+        running_bundle.with_extension("app")
+    } else {
+        running_bundle.to_path_buf()
+    }
 }
 
 fn create_temp_dir() -> Result<PathBuf, String> {
@@ -752,24 +787,72 @@ fn install_update(download_url: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command(rename_all = "camelCase")]
-fn restart_app(_app: AppHandle) -> Result<(), String> {
-    let app_bundle = find_app_bundle_path()?;
-    let backup_bundle = app_bundle.with_extension("app.old");
-    // Use nohup + disown equivalent: fully detached process that outlives us
-    let script = format!(
-        "sleep 2; rm -rf '{}'; open -n '{}'; exit 0",
-        backup_bundle.display(),
-        app_bundle.display()
-    );
-    let _ = Command::new("/usr/bin/nohup")
-        .args(["/bin/sh", "-c", &script])
+fn spawn_restart_helper(app_bundle: &Path, backup_bundle: &Path) -> Result<(), String> {
+    let temp_dir = create_temp_dir()?;
+    let script_path = temp_dir.join("restart.sh");
+    let script = r#"#!/bin/sh
+TARGET_PID="$MYTERM_PID"
+APP_BUNDLE="$MYTERM_APP"
+BACKUP_BUNDLE="$MYTERM_BACKUP"
+
+i=0
+while [ $i -lt 15 ]; do
+  if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+  i=$((i+1))
+done
+
+sleep 0.5
+/usr/bin/open -n "$APP_BUNDLE" >/dev/null 2>&1
+sleep 1
+/bin/rm -rf "$BACKUP_BUNDLE" >/dev/null 2>&1
+"#;
+
+    fs::write(&script_path, script).map_err(|err| err.to_string())?;
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg(&script_path)
+        .env("MYTERM_PID", format!("{}", std::process::id()))
+        .env("MYTERM_APP", app_bundle)
+        .env("MYTERM_BACKUP", backup_bundle)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    // Hard exit to avoid cleanup hooks that might hang
-    std::process::exit(0);
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.spawn().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn restart_app(app: AppHandle, state: State<RestartState>) -> Result<(), String> {
+    let running_bundle = find_app_bundle_path()?;
+    let app_bundle = resolve_primary_app_bundle_path(&running_bundle);
+    let backup_bundle = app_bundle.with_extension("app.old");
+
+    if !app_bundle.exists() {
+        return Err(format!(
+            "Updated app bundle not found at {}",
+            app_bundle.display()
+        ));
+    }
+
+    spawn_restart_helper(&app_bundle, &backup_bundle)?;
+    state.mark_update_restart();
+    app.exit(0);
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -778,6 +861,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessManager::default())
+        .manage(RestartState::default())
         .invoke_handler(tauri::generate_handler![
             load_project_config,
             init_project_config,
@@ -791,6 +875,11 @@ pub fn run() {
         .expect("error while running tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let restart_state = app_handle.state::<RestartState>();
+                if restart_state.should_skip_cleanup() {
+                    return;
+                }
+
                 // Ensure we don't leave orphaned dev servers running.
                 api.prevent_exit();
 
