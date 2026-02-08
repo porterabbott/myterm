@@ -1,10 +1,9 @@
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
-    fs::{self, File},
-    io::{self, BufRead, BufReader},
+    fs::{self},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -636,25 +635,19 @@ fn stop_process(
 #[tauri::command(rename_all = "camelCase")]
 fn check_for_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let current_version = app.package_info().version.to_string();
-    let client = Client::builder()
-        .user_agent("MyTerm")
-        .build()
-        .map_err(|err| err.to_string())?;
 
-    let response = client
-        .get("https://api.github.com/repos/porterabbott/myterm/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .map_err(|err| err.to_string())?;
+    let output = Command::new("gh")
+        .args(["api", "repos/porterabbott/myterm/releases/latest"])
+        .output()
+        .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
-    if !response.status().is_success() {
-        return Err(format!(
-            "GitHub API returned {}",
-            response.status()
-        ));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh api failed: {}", stderr.trim()));
     }
 
-    let release: GithubRelease = response.json().map_err(|err| err.to_string())?;
+    let release: GithubRelease =
+        serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
     let latest_tag = release.tag_name.clone();
     let latest_version = latest_tag.trim_start_matches('v');
     let available = is_newer_version(latest_version, &current_version);
@@ -693,21 +686,16 @@ fn install_update(download_url: String) -> Result<(), String> {
     let extract_dir = temp_dir.join("extract");
     fs::create_dir_all(&extract_dir).map_err(|err| err.to_string())?;
 
-    let client = Client::builder()
-        .user_agent("MyTerm")
-        .build()
-        .map_err(|err| err.to_string())?;
-    let mut response = client
-        .get(&download_url)
-        .send()
-        .map_err(|err| err.to_string())?;
+    // Use gh CLI to download the asset (handles auth for private repos)
+    let dl_status = Command::new("gh")
+        .args(["release", "download", "--repo", "porterabbott/myterm", "--pattern", "MyTerm.zip", "--dir"])
+        .arg(&temp_dir)
+        .status()
+        .map_err(|err| format!("Failed to run gh CLI: {}", err))?;
 
-    if !response.status().is_success() {
-        return Err(format!("Download failed: {}", response.status()));
+    if !dl_status.success() {
+        return Err("gh release download failed".to_string());
     }
-
-    let mut file = File::create(&zip_path).map_err(|err| err.to_string())?;
-    io::copy(&mut response, &mut file).map_err(|err| err.to_string())?;
 
     let unzip_status = Command::new("unzip")
         .arg("-q")
