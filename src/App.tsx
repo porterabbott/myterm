@@ -85,6 +85,17 @@ function loadProjectPaths(): string[] {
   }
 }
 
+function isMissingConfigError(message: string): boolean {
+  const msg = message.toLowerCase();
+  if (msg.includes("missing myterm.yml")) return true;
+
+  // Back-compat for older backend errors (e.g. os error 2)
+  const looksLikeNotFound =
+    msg.includes("no such file") || msg.includes("os error 2");
+  const mentionsConfigFile = msg.includes("myterm.yml") || msg.includes("myterm.yaml");
+  return looksLikeNotFound && mentionsConfigFile;
+}
+
 export default function App() {
   const [projects, setProjects] = useState<ProjectView[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -234,6 +245,32 @@ export default function App() {
     }
   };
 
+  const recoverNoConfigState = async (project: ProjectView, reason?: string) => {
+    // Stop any managed processes for this project (best-effort)
+    await Promise.allSettled(
+      project.processes.map((process) =>
+        invoke("stop_process", {
+          projectPath: project.path,
+          processName: process.name,
+        })
+      )
+    );
+
+    // Clear processes + show "no config" UI
+    setProjects((prev) =>
+      prev.map((p) => {
+        if (p.id !== project.id) return p;
+        return {
+          ...p,
+          actions: [],
+          processes: [],
+          configError: reason ?? "Missing myterm.yml",
+        };
+      })
+    );
+    setSelectedProcessName(null);
+  };
+
   const stopProcess = async (project: ProjectView, process: ProcessView) => {
     setError(null);
     try {
@@ -286,13 +323,15 @@ export default function App() {
       }
     } catch (err) {
       const errorMsg = String(err);
+      const missingConfig = isMissingConfigError(errorMsg);
+
       const project: ProjectView = {
         id: path,
         path,
         name: path.split("/").pop() || "unknown",
         actions: [],
         processes: [],
-        configError: errorMsg,
+        configError: missingConfig ? "Missing myterm.yml" : errorMsg,
       };
 
       setProjects((prev) => {
@@ -303,7 +342,11 @@ export default function App() {
         return updated;
       });
       setSelectedProjectId(project.id);
-      setError(`Could not load config for ${path}: ${errorMsg}`);
+
+      // Missing config is an expected state; don't show a scary raw error.
+      if (!missingConfig) {
+        setError(`Could not load config for ${path}: ${errorMsg}`);
+      }
     }
   };
 
@@ -408,7 +451,13 @@ export default function App() {
       );
       return true;
     } catch (err) {
-      setError(`Failed to reload config: ${String(err)}`);
+      const errorMsg = String(err);
+      if (isMissingConfigError(errorMsg)) {
+        await recoverNoConfigState(project, "Missing myterm.yml");
+        return false;
+      }
+
+      setError(`Failed to reload config: ${errorMsg}`);
       return false;
     }
   };
@@ -705,6 +754,13 @@ export default function App() {
                     {selectedProject.configError ? (
                       <>
                         <button
+                          onClick={() => handleReloadConfig(selectedProject)}
+                          className="text-slate-400 hover:text-slate-300 transition"
+                          title="Reload myterm.yml"
+                        >
+                          Reload
+                        </button>
+                        <button
                           onClick={() => handleCreateConfig(selectedProject)}
                           className="text-emerald-400 hover:text-emerald-300 transition"
                           title="Create myterm.yml"
@@ -783,7 +839,9 @@ export default function App() {
                 <div className="flex-1 flex items-center justify-center">
                   <div className="text-center max-w-md">
                     <div className="text-slate-400 mb-4">
-                      No <code className="bg-slate-800 px-1 py-0.5 rounded text-xs">myterm.yml</code> found in this project.
+                      No config found — create a{" "}
+                      <code className="bg-slate-800 px-1 py-0.5 rounded text-xs">myterm.yml</code>
+                      {" "}or click Create.
                     </div>
                     <button
                       onClick={() => handleCreateConfig(selectedProject)}

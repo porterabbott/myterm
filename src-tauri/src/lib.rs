@@ -173,8 +173,6 @@ fn find_existing_config_path(project_path: &Path) -> Option<PathBuf> {
 }
 
 fn read_project_config(project_path: &Path) -> Result<ProjectConfig, String> {
-    let mut last_err: Option<String> = None;
-
     for candidate in config_path_candidates(project_path) {
         match std::fs::read_to_string(&candidate) {
             Ok(contents) => {
@@ -182,12 +180,15 @@ fn read_project_config(project_path: &Path) -> Result<ProjectConfig, String> {
                     .map_err(|err| format!("{} ({})", err, candidate.display()));
             }
             Err(err) => {
-                last_err = Some(format!("{} ({})", err, candidate.display()));
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
+                return Err(format!("{} ({})", err, candidate.display()));
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| "Missing myterm.yml".to_string()))
+    Err("Missing myterm.yml".to_string())
 }
 
 #[cfg(unix)]
